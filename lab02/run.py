@@ -3,6 +3,7 @@
 Запуск: python lab02/run.py, для CI python lab02/run.py --fast.
 """
 import argparse
+import re
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -19,6 +20,37 @@ def download_file(url: str) -> Path:
     destination.write_bytes(content)
     return destination
 
+def extract_words(file_path: str | Path) -> list[str]:
+    text = Path(file_path).read_text(encoding="utf-8")
+    normalized_text = text.lower().replace("ё", "е")
+    words_list = re.findall(r"[а-я]+(?:-[а-я]+)*", normalized_text)
+
+    chars_list = []
+    for word in words_list: 
+        for char in word:
+            chars_list.append(char)
+        chars_list.append('</w>') # Добавляем маркер конца слова
+    
+    return chars_list
+
+def find_max_repetitions(chars):
+    """Ищет самую частую пару символов"""
+    pairs = {}
+    max_key = None 
+    max_value = 0
+    for i in range(len(chars)-1):
+        if chars[i] == '</w>': # Пара не должна начинаться с конца слова
+            continue 
+        current_key = (chars[i], chars[i+1])
+        current_value = pairs.get(current_key, 0)
+
+        pairs[current_key] = current_value + 1
+
+        if pairs.get(current_key) > max_value:
+            max_key = current_key
+            max_value = pairs.get(current_key)
+
+    return max_key, pairs.get(max_key, 0)
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -30,7 +62,14 @@ def main() -> None:
     corpus_destination = download_file(CORPUS_URL)
     print(f'Файл скачан в {corpus_destination}')
 
-    raise NotImplementedError("работа не начата")
+    # Обрабатываем текст, разбиваем на символы, добавляем маркер конца строки
+    chars_list = extract_words(corpus_destination)
+    print(f'Текст разбит на символы {len(chars_list)}')
+
+    max_key, max_value = find_max_repetitions(chars_list)
+    print(f'Самая часто встречающаяся пара {max_key}, {max_value}')
+
+    #raise NotImplementedError("работа не начата")
 
 
 if __name__ == "__main__":
