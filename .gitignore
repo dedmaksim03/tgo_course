@@ -29,3 +29,6 @@ htmlcov/
 .vscode/
 .DS_Store
 Thumbs.db
+
+# Для лабораторной 2
+/lab02/corpus.txt
