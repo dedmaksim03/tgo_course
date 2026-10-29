@@ -26,52 +26,77 @@ def extract_words(file_path: str | Path) -> list[str]:
     words_list = re.findall(r"[а-я]+(?:-[а-я]+)*", normalized_text)
     return words_list
 
-def split_chars(words_list: list[str]) -> list[str]:
-    chars_list = []
-    for word in words_list: 
-        for char in word:
-            chars_list.append(char)
-        chars_list.append('</w>') # Добавляем маркер конца слова
-    
-    return chars_list
+def split_chars(words_count):
+    """Каждый ключ разбивает на символы"""
+    words_dict = {}
+    for word, frequency in words_count.items():
+        words_dict[tuple(word) + ('</w>',)] = frequency
+    return words_dict
 
-def find_max_repetitions(chars):
+def find_max_repetitions(words_dict):
     """Ищет самую частую пару символов"""
     pairs = {}
     max_key = None 
     max_value = 0
-    for i in range(len(chars)-1):
-        if chars[i] == '</w>': # Пара не должна начинаться с конца слова
-            continue 
-        current_key = (chars[i], chars[i+1])
-        current_value = pairs.get(current_key, 0)
+    for chars, frequency in words_dict.items():
+        for i in range(len(chars)-1):
+            current_key = (chars[i], chars[i+1])
+            current_value = pairs.get(current_key, 0) + frequency
+            pairs[current_key] = current_value
 
-        pairs[current_key] = current_value + 1
-
-        if pairs.get(current_key) > max_value:
-            max_key = current_key
-            max_value = pairs.get(current_key)
+            if current_value > max_value:
+                max_key = current_key
+                max_value = current_value
 
     return max_key, pairs.get(max_key, 0)
 
 def delete_words_below_threshold(words, th=2):
     """Убирает слова, встречаемость которых ниже порога"""
     words_count = {}
-    cleaned_words = []
+    cleaned_words = {}
 
     for word in words:
         words_count[word] = words_count.get(word, 0) + 1
 
-    for word in words:
-        repetitions = words_count[word]
-
+    for word, repetitions in words_count.items():
         if repetitions >= th:
-            cleaned_words.append(word)
+            cleaned_words[word] = repetitions
 
     return cleaned_words
 
-def bpe(chars):
-    pass
+def replace_chars(chars, key):
+    new_chars = []
+    i = 0
+    while i < len(chars)-1:
+        if (chars[i], chars[i+1]) != key:
+            new_chars.append(chars[i])
+            i += 1
+        else:
+            new_chars.append(key[0]+key[1])
+            i += 2
+    # Добавляем последний символ
+    if i < len(chars):
+        new_chars.append(chars[i])
+    return new_chars
+
+def bpe(words_dict, num_merges=1500):
+
+    tokens = words_dict.copy()
+
+    for i in range(num_merges):
+        key, count = find_max_repetitions(tokens)
+        if key is None:
+            break
+        new_tokens = {}
+        for chars, frequency in tokens.items():
+            merged = tuple(replace_chars(chars, key))
+            new_tokens[merged] = new_tokens.get(merged, 0) + frequency
+        tokens = new_tokens
+
+        print(f"\rСлияние {i + 1} из {num_merges}, пара: {key}", end="", flush=True)
+    return tokens
+            
+
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -89,15 +114,22 @@ def main() -> None:
 
     # Убираем слова ниже порога
     cleaned_words = delete_words_below_threshold(words, th=2)
-    print(f'Слова очищены, кол-во слов было {len(words)}, стало {len(cleaned_words)}')
+    print(f'После фильтрации: {sum(cleaned_words.values())} слов, уникальных: {len(cleaned_words)}')
 
-    # Разбиваем на символы, добавляем маркер конца строки
-    chars_list = split_chars(cleaned_words)
-    print(f'Текст разбит на символы {len(chars_list)}')
+    # Разбиваем ключ на символы, добавляем маркер конца строки
+    words_dict = split_chars(cleaned_words)
+    initial_len = sum(len(chars) * frequency for chars, frequency in words_dict.items())
+    print(f'Количество символов с маркерами в обучающем корпусе: {initial_len}')
 
-    max_key, max_value = find_max_repetitions(chars_list)
+    max_key, max_value = find_max_repetitions(words_dict)
     print(f'Самая часто встречающаяся пара {max_key}, {max_value}')
 
+    # Запускаем метод BPE для получения токенов
+    tokens = bpe(words_dict, num_merges=200 if args.fast else 1500)
+    final_len = sum(len(chars) * frequency for chars, frequency in tokens.items())
+    print(f'Исходная длина/итоговая длина обучающего корпуса: {initial_len}/{final_len}')
+    for word_tokens, frequency in list(tokens.items())[:15]:
+        print(f"Токены: {word_tokens}, частота: {frequency}")
     #raise NotImplementedError("работа не начата")
 
 
