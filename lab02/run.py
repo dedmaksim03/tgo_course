@@ -5,12 +5,21 @@
 import argparse
 import json
 import re
+from functools import lru_cache
 from pathlib import Path
 from urllib.request import urlopen
 
 HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
 CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/master/books_before/WarAndPeace.txt"
+TOKENIZER_NAME = "Qwen/Qwen3-0.6B-Base"
+ENGLISH_PARAGRAPH = (
+    "The prince had been talking for almost an hour, and the guests were growing tired. "
+    "Anna looked at the clock, then at the window, then at the clock again. "
+    "Nobody dared to leave before the host, and the host did not seem to notice the time at all. "
+    "A servant brought tea, and the conversation turned, as it always did in that house, "
+    "to the war and to the emperor."
+)
 
 
 def download_file(url: str) -> Path:
@@ -142,6 +151,59 @@ def create_bpe_json(stats, merges, words_dict):
     )
     return destination
             
+@lru_cache(maxsize=1)
+def get_qwen_tokenizer():
+    """Загрузить токенизатор один раз; веса модели здесь не нужны."""
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(TOKENIZER_NAME)
+
+
+def count_tokens(text: str) -> int:
+    """Число токенов Qwen3 в тексте без добавления специальных токенов."""
+    tokenizer = get_qwen_tokenizer()
+    return len(tokenizer.encode(text, add_special_tokens=False))
+
+
+def compare_tokens_per_word(words):
+    """Сравнить русский и английский отрывки и сохранить tokens_per_word.json."""
+    tokenizer = get_qwen_tokenizer()
+    # Сто слов нормализованного корпуса: срез с индексами 500–599.
+    russian_paragraph = " ".join(words[500:600])
+    context_tokens = 4096
+    data = {
+        "tokenizer": TOKENIZER_NAME,
+        "vocab_size": len(tokenizer),
+        "context_tokens": context_tokens,
+    }
+    for language, text in (("ru", russian_paragraph), ("en", ENGLISH_PARAGRAPH)):
+        word_count = len(text.split())
+        token_count = count_tokens(text)
+        tokens_per_word = token_count / word_count
+        data[language] = {
+            "words": word_count,
+            "tokens": token_count,
+            "tokens_per_word": tokens_per_word,
+            "words_in_context": int(context_tokens / tokens_per_word),
+        }
+        print(
+            f'{language}: {word_count} слов, {token_count} токенов, '
+            f'{tokens_per_word:.3f} токена на слово'
+        )
+
+    # .encode возвращает закодированный список токенов, на которые он разбил текст
+    # каждый токен это число - и .decode позволяет получить токен по этому числу
+    russian_ids = tokenizer.encode(russian_paragraph, add_special_tokens=False)
+    data["example_ru"] = [tokenizer.decode([token_id]) for token_id in russian_ids]
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "tokens_per_word.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="быстрый режим для CI")
@@ -202,8 +264,14 @@ def main() -> None:
         "tokens_per_word": count_tokens / count_words,
         "compression_vs_chars": count_chars / count_tokens,
     }
+
+    # Задание 1: создаем bpe.json
     bpe_destination = create_bpe_json(stats, merges, words_dict_all)
     print(f'Результаты BPE сохранены в {bpe_destination}')
+
+    # Задание 2: используем токенизатор Qwen и сравниваем число токенов для русского и английского текста
+    tokens_destination = compare_tokens_per_word(words)
+    print(f'Сравнение токенизации сохранено в {tokens_destination}')
 
 
     #raise NotImplementedError("работа не начата")
