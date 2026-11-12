@@ -3,6 +3,7 @@
 Запуск: python lab02/run.py, для CI python lab02/run.py --fast.
 """
 import argparse
+import json
 import re
 from pathlib import Path
 from urllib.request import urlopen
@@ -82,6 +83,7 @@ def replace_chars(chars, key):
 def bpe(words_dict, num_merges=1500):
 
     tokens = words_dict.copy()
+    merges = []
 
     for i in range(num_merges):
         key, count = find_max_repetitions(tokens)
@@ -92,12 +94,54 @@ def bpe(words_dict, num_merges=1500):
             merged = tuple(replace_chars(chars, key))
             new_tokens[merged] = new_tokens.get(merged, 0) + frequency
         tokens = new_tokens
+        merges.append(key)
 
         print(f"\rСлияние {i + 1} из {num_merges}, пара: {key}", end="", flush=True)
+    return tokens, merges
+
+def tokenize(word_dict, merges):
+    tokens = word_dict.copy()
+    for i in range(len(merges)):
+        key = merges[i]
+        new_tokens = {}
+        for chars, frequency in tokens.items():
+            merged = tuple(replace_chars(chars, key))
+            new_tokens[merged] = new_tokens.get(merged, 0) + frequency
+        tokens = new_tokens
+
+        print(f"\rСлияние {i + 1} из {len(merges)}, пара: {key}", end="", flush=True)
+
     return tokens
+
+
+def create_bpe_json(stats, merges, words_dict):
+
+    # Полный словарь BPE состоит из всех изначальных токенов + новые токены на каждом шаге merges
+    vocab = {char for chars in words_dict for char in chars}
+    vocab.update(left + right for left, right in merges)
+
+    examples = {}
+    for word in ("наполеон", "сказала", "неудовольствие"):
+        chars = list(word) + ["</w>"]
+        for key in merges:
+            chars = replace_chars(chars, key)
+        examples[word] = chars
+
+    data = {
+        "num_merges": len(merges),
+        "vocab_size": len(vocab),
+        "merges": merges,
+        "stats": stats,
+        "examples": examples,
+    }
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "bpe.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return destination
             
-
-
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="быстрый режим для CI")
@@ -110,28 +154,59 @@ def main() -> None:
 
     # Обрабатываем текст, получаем список слов
     words = extract_words(corpus_destination)
-    print(f'Текст прочитан, количество слов: {len(words)}')
+    print(f'Текст прочитан, количество всех слов: {len(words)}')
 
     # Убираем слова ниже порога
-    cleaned_words = delete_words_below_threshold(words, th=2)
-    print(f'После фильтрации: {sum(cleaned_words.values())} слов, уникальных: {len(cleaned_words)}')
+    cleaned_words_train = delete_words_below_threshold(words, th=5)
+    cleaned_words_all = delete_words_below_threshold(words, th=1)
+    print(f'После фильтрации: {sum(cleaned_words_train.values())} слов, уникальных: {len(cleaned_words_train)}')
 
     # Разбиваем ключ на символы, добавляем маркер конца строки
-    words_dict = split_chars(cleaned_words)
-    initial_len = sum(len(chars) * frequency for chars, frequency in words_dict.items())
-    print(f'Количество символов с маркерами в обучающем корпусе: {initial_len}')
+    words_dict_train = split_chars(cleaned_words_train)
+    words_dict_all = split_chars(cleaned_words_all)
+    initial_len_train = sum(len(chars) * frequency for chars, frequency in words_dict_train.items())
+    initial_len_all = sum(len(chars) * frequency for chars, frequency in words_dict_all.items())
+    print(f'Количество символов с маркерами в обучающем корпусе/во всем корпусе: \
+          {initial_len_train}/{initial_len_all}')
 
-    max_key, max_value = find_max_repetitions(words_dict)
+    max_key, max_value = find_max_repetitions(words_dict_train)
     print(f'Самая часто встречающаяся пара {max_key}, {max_value}')
 
-    # Запускаем метод BPE для получения токенов
-    tokens = bpe(words_dict, num_merges=200 if args.fast else 1500)
-    final_len = sum(len(chars) * frequency for chars, frequency in tokens.items())
-    print(f'Исходная длина/итоговая длина обучающего корпуса: {initial_len}/{final_len}')
-    for word_tokens, frequency in list(tokens.items())[:15]:
-        print(f"Токены: {word_tokens}, частота: {frequency}")
-    #raise NotImplementedError("работа не начата")
+    # Запускаем обучение BPE для получения токенов и слияний
+    _, merges = bpe(words_dict_train, num_merges=200 if args.fast else 1500)
 
+    # Запускаем токенизацию на всем корпусе, включая редкие слова
+    tokens = tokenize(words_dict_all, merges)
+
+    print("\n")
+    for word_tokens, frequency in list(tokens.items())[:10]:
+        print(f"Токены: {word_tokens}, частота: {frequency}")
+
+    # Считаем количество символов и количество слов во всем корпусе
+    count_chars = sum(
+        (len(chars) - 1) * frequency
+        for chars, frequency in words_dict_all.items()
+    )
+    count_words = sum(words_dict_all.values())
+    count_tokens = sum(
+        len(t) * frequency
+        for t, frequency in tokens.items()        
+    )
+
+    print(f'Количество символов/слов/токенов: {count_chars}/{count_words}/{count_tokens}')
+
+    stats = {
+        "chars": count_chars,
+        "words": count_words,
+        "tokens_bpe": count_tokens,
+        "tokens_per_word": count_tokens / count_words,
+        "compression_vs_chars": count_chars / count_tokens,
+    }
+    bpe_destination = create_bpe_json(stats, merges, words_dict_all)
+    print(f'Результаты BPE сохранены в {bpe_destination}')
+
+
+    #raise NotImplementedError("работа не начата")
 
 if __name__ == "__main__":
     main()
