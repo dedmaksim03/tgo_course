@@ -5,6 +5,8 @@
 import argparse
 import json
 import re
+import torch
+from transformers import AutoModel
 from functools import lru_cache
 from pathlib import Path
 from urllib.request import urlopen
@@ -20,6 +22,20 @@ ENGLISH_PARAGRAPH = (
     "A servant brought tea, and the conversation turned, as it always did in that house, "
     "to the war and to the emperor."
 )
+SEARCH_QUERIES = [
+    ("Хозяйка вечера несколько дней болела гриппом и утром разослала приглашения", "кашляла несколько дней"),
+    ("Отец говорит, что оба его сына дураки, только один спокойный, а другой беспокойный", "покойный дурак"),
+    ("Богатый и скупой старый князь живет в деревне, его прозвали прусским королем", "прозванный прусским королем"),
+    ("Гости по очереди здоровались с никому не нужной тетушкой", "никому не интересной и не нужной тетушки"),
+    ("Брат удивительно похож на сестру-красавицу, но при этом очень некрасив", "поразительно дурен собой"),
+    ("В гостиную входит невысокий молодой князь с усталым и скучающим взглядом", "усталого, скучающего взгляда"),
+    ("Обедневшая княгиня приехала просить, чтобы ее сына перевели в гвардию", "выхлопотать определение в гвардию"),
+    ("Спор о революции: народ отдал Бонапарту власть, чтобы избавиться от Бурбонов", "избавил его от Бурбонов"),
+    ("Неуклюжий толстый гость по рассеянности взял чужую генеральскую шляпу", "треугольную шляпу с генеральским плюмажем"),
+    ("Мальчика десяти лет отправили за границу с гувернером-аббатом", "гувернером-аббатом за границу"),
+    ("Совет другу: не женись, пока не сделал всего, что мог", "не женись до тех пор"),
+    ("Светлая петербургская ночь, второй час, он едет домой и не может заснуть", "бессумрачная ночь"),
+]
 
 
 def download_file(url: str) -> Path:
@@ -35,6 +51,148 @@ def extract_words(file_path: str | Path) -> list[str]:
     normalized_text = text.lower().replace("ё", "е")
     words_list = re.findall(r"[а-я]+(?:-[а-я]+)*", normalized_text)
     return words_list
+
+def extract_paragraphs(file_path: str | Path, max_paragraphs=500):
+    paragraphs = []
+
+    text = Path(file_path).read_text(encoding="utf-8")
+    for paragraph in text.splitlines():
+        normalized_paragraph = paragraph.lower().replace("ё", "е")
+        words_list = re.findall(r"[а-я]+(?:-[а-я]+)*", normalized_paragraph)
+
+        if 40 <= len(words_list) <= 120:
+            paragraphs.append(paragraph)    
+
+    return paragraphs[:max_paragraphs]    
+
+def create_paragraphs_json(paragraphs):
+    """Сохранить исходные абзацы с номерами в порядке отбора."""
+    data = [{"id": i, "text": paragraph} for i, paragraph in enumerate(paragraphs)]
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "paragraphs.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return destination
+
+
+def get_static_vector(text: str, model, tokenizer):
+    """Принимает текст, разбивает на токены, получает эмбэдинг каждого токена, 
+        и усредняет их превращая в один вектор"""
+
+    # Форма input_ids: [1, число токенов]. Каждый текст обрабатывается отдельно,
+    # поэтому дополнения (padding) нет и все токены участвуют в среднем.
+    input_ids = tokenizer(
+        text, return_tensors="pt", add_special_tokens=False,
+    )["input_ids"]
+    if input_ids.shape[1] == 0:
+        raise ValueError("Нельзя получить средний вектор текста без токенов")
+
+    embedding_layer = model.get_input_embeddings()
+    input_ids = input_ids.to(embedding_layer.weight.device)
+    with torch.inference_mode():
+        # [1, число токенов, размерность вектора]. Слои внимания не вызываются.
+        # Т.е. каждый токен имеет свой эмбэдинг, и мы их получаем
+        token_vectors = embedding_layer(input_ids)
+        # Усредняем по токенам: [1, размерность] -> [размерность].
+        vector = token_vectors.float().mean(dim=1).squeeze(0)
+    return vector.cpu()
+
+
+def get_contextual_vector(text: str, model, tokenizer):
+    """Пропустить текст через Qwen3 и усреднить состояния последнего слоя."""
+    inputs = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+    if inputs["input_ids"].shape[1] == 0:
+        raise ValueError("Нельзя получить средний вектор текста без токенов")
+
+    device = model.get_input_embeddings().weight.device
+    inputs = inputs.to(device)
+    with torch.inference_mode():
+        outputs = model(**inputs, output_hidden_states=True, use_cache=False)
+        # Как и у static: [1, число токенов, размерность], но уже после слоев модели.
+        token_vectors = outputs.hidden_states[-1]
+        # Обрабатываем один текст без padding, поэтому усредняем все его токены.
+        vector = token_vectors.float().mean(dim=1).squeeze(0)
+    return vector.cpu()
+
+
+def search_by_cosine(query_vector, paragraph_vectors, k=5):
+    """Выбрать номера k ближайших абзацев по готовым векторам любого способа."""
+    # Сравниваем один вектор запроса с каждой строкой матрицы абзацев.
+    similarities = torch.nn.functional.cosine_similarity(
+        paragraph_vectors, query_vector.unsqueeze(0), dim=1,
+    )
+    # При одинаковой близости сохраняем исходный порядок абзацев.
+    return torch.argsort(similarities, descending=True, stable=True)[:k].tolist()
+
+
+def create_search_json(paragraphs, paragraph_vectors, model, tokenizer):
+    """Идет по таблице запросов из задания, находит нужный абзац по ключевой фразе,
+        получает вектор запроса, сравнивает этот вектор с каждым вектором абзацев, находит ближайшие"""
+    k = 5
+    queries = []
+    # Для каждого способа передается своя матрица векторов абзацев.
+    vector_functions = {
+        "static": get_static_vector,
+        "contextual": get_contextual_vector,
+    }
+    hits = {method: 0 for method in paragraph_vectors}
+    for query, answer_phrase in SEARCH_QUERIES:
+
+        # Находим id правильного абзаца (answer_id) по ключевой фразе answer_phrase
+        normalized_phrase = answer_phrase.lower().replace("ё", "е")
+        answer_id = next(
+            (i for i, paragraph in enumerate(paragraphs)
+             if normalized_phrase in paragraph.lower().replace("ё", "е")),
+            None,
+        )
+
+        # Ищем k самых близких векторов абзацев к вектору запроса
+        top = {}
+        for method, vectors in paragraph_vectors.items():
+            query_vector = vector_functions[method](query, model, tokenizer)
+            top[method] = search_by_cosine(query_vector, vectors, k=k)
+        
+        # Определеяем, есть ли среди k самых близких векторов абзацев правильный абзац
+        found = {
+            method: answer_id is not None and answer_id in ids
+            for method, ids in top.items()
+        }
+
+        # Общее количество попаданий
+        for method in hits:
+            hits[method] += int(found[method])
+        
+        queries.append({
+            "query": query,
+            "answer_phrase": answer_phrase,
+            "answer_id": answer_id,
+            "top": top,
+        })
+        print(
+            f'Запрос {len(queries)}: top-{k}={top}, '
+            f'правильный абзац={answer_id}, найден={found}'
+        )
+
+    # Если нужного абзаца нет в отобранном корпусе, запрос считается неуспешным.
+    recall = {method: count / len(SEARCH_QUERIES) for method, count in hits.items()}
+    data = {
+        "k": k,
+        "n_paragraphs": len(paragraphs),
+        "queries": queries,
+        "recall_at_k": recall,
+    }
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "search.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    for method in hits:
+        print(f'{method} recall@{k}: {hits[method]}/{len(SEARCH_QUERIES)} = {recall[method]:.3f}')
+    return destination
+
 
 def split_chars(words_count):
     """Каждый ключ разбивает на символы"""
@@ -273,8 +431,46 @@ def main() -> None:
     tokens_destination = compare_tokens_per_word(words)
     print(f'Сравнение токенизации сохранено в {tokens_destination}')
 
+    # Получаем список параграфов длиной от 40 до 120 слов для задания 3
+    paragraphs = extract_paragraphs(corpus_destination, max_paragraphs=60 if args.fast else 500)
+    print(f'Список парграфов длиной: {len(paragraphs)}')
+    for i in range(len(paragraphs[:60])):
+        print(f'{i}: {paragraphs[i]}')
 
-    #raise NotImplementedError("работа не начата")
+    # Записываем параграфы в json для artifacts
+    paragraphs_destination = create_paragraphs_json(paragraphs)
+    print(f'Абзацы сохранены в {paragraphs_destination}')
+
+    print('Загружаем Qwen3 для получения входных эмбеддингов')
+    model = AutoModel.from_pretrained(TOKENIZER_NAME, dtype="auto")
+    model.eval()
+    tokenizer = get_qwen_tokenizer()
+
+    # Берем полученные абзацы и переводим каждый абзац в один вектор
+    # static_vectors это список векторов, каждый из которых представляет собой один абзац
+    static_vectors = torch.stack([
+        get_static_vector(paragraph, model, tokenizer)
+        for paragraph in paragraphs
+    ])
+    print(f'Форма матрицы static: {tuple(static_vectors.shape)}')
+    print(f'Первые 5 чисел вектора первого абзаца: {static_vectors[0, :5].tolist()}')
+
+    # Контекстный метод - переводим параграфы в токены, пропускает через внимание модели
+    # берем выходные векторы
+    contextual_vectors = []
+    for i, paragraph in enumerate(paragraphs):
+        contextual_vectors.append(get_contextual_vector(paragraph, model, tokenizer))
+        print(f'\rContextual: {i + 1}/{len(paragraphs)} абзацев', end="", flush=True)
+    contextual_vectors = torch.stack(contextual_vectors)
+    print(f'\nФорма матрицы contextual: {tuple(contextual_vectors.shape)}')
+
+    search_destination = create_search_json(
+        paragraphs,
+        {"static": static_vectors, "contextual": contextual_vectors},
+        model,
+        tokenizer,
+    )
+    print(f'Результаты static и contextual сохранены в {search_destination}')
 
 if __name__ == "__main__":
     main()
