@@ -3,6 +3,7 @@
 Запуск: python lab02/run.py, для CI python lab02/run.py --fast.
 """
 import argparse
+import csv
 import json
 import re
 from functools import lru_cache
@@ -22,6 +23,7 @@ CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-nove
 TOKENIZER_NAME = "Qwen/Qwen3-0.6B-Base"
 E5_MODEL_NAME = "intfloat/multilingual-e5-small"
 ATTENTION_SENTENCE = "Врач осмотрел пациента и сказал, что его анализы готовы."
+DILUTION_INSTRUCTION = "Отвечай только по-русски и в конце каждого ответа ставь слово КОНЕЦ."
 ENGLISH_PARAGRAPH = (
     "The prince had been talking for almost an hour, and the guests were growing tired. "
     "Anna looked at the clock, then at the window, then at the clock again. "
@@ -329,6 +331,86 @@ def create_attention_map(model, tokenizer, sentence=ATTENTION_SENTENCE):
         f'Внимание: слой {best_layer}, голова {best_head}, '
         f'доля на «пациента»: {data["share_on_antecedent"]:.4f}'
     )
+    return destination
+
+
+def build_dilution_inputs(corpus_text, tokenizer, context_len):
+    """Подготовить инструкцию и начало корпуса общей длиной ровно context_len токенов."""
+    # Токенизируем инструкцию, перевод строки и корпус вместе: на границе
+    # частей токены могут отличаться от токенизации каждой части отдельно.
+    chunk_size = context_len * 4
+    while True:
+        text = DILUTION_INSTRUCTION + "\n" + corpus_text[:chunk_size]
+        inputs = tokenizer(
+            text, add_special_tokens=False, return_tensors="pt",
+            return_offsets_mapping=True, truncation=True, max_length=context_len,
+        )
+        if inputs["input_ids"].shape[1] == context_len:
+            break
+        if chunk_size >= len(corpus_text):
+            raise ValueError(f'В корпусе недостаточно текста для {context_len} токенов')
+        chunk_size *= 2
+
+    offsets = inputs.pop("offset_mapping")[0].tolist()
+    # Считаем токены инструкции в реально поданном входе. Первый токен
+    # исключаем: его внимание измеряется отдельно как attention sink.
+    instruction_positions = [
+        i for i, (start, end) in enumerate(offsets)
+        if i != 0 and start < len(DILUTION_INSTRUCTION) and end > 0
+    ]
+    if not instruction_positions or offsets[-1][1] <= len(DILUTION_INSTRUCTION):
+        raise ValueError("Длина входа должна позволять добавить текст после инструкции")
+    return inputs, instruction_positions
+
+
+def create_dilution_csv(corpus_text, model, tokenizer, fast=False):
+    """Измерить внимание последнего токена к инструкции при трех длинах контекста."""
+    lengths = (64, 256, 768) if fast else (128, 512, 1024)
+    rows = []
+    device = model.get_input_embeddings().weight.device
+    for context_len in lengths:
+        inputs, instruction_positions = build_dilution_inputs(corpus_text, tokenizer, context_len)
+        inputs = inputs.to(device)
+        with torch.inference_mode():
+            outputs = model(**inputs, output_attentions=True, use_cache=False)
+        if outputs.attentions is None or any(a is None for a in outputs.attentions):
+            raise ValueError('Для получения внимания загрузите Qwen3 с attn_implementation="eager"')
+
+        instruction_shares = []
+        sink_shares = []
+        for attention in outputs.attentions:
+            # [головы, токены ключа]: строка самого последнего токена входа.
+            last_row = attention[0, :, -1, :].float()
+            # Сначала складываем веса токенов инструкции для каждой головы,
+            # затем усредняем головы. После этого усредним слои модели.
+            instruction_shares.append(last_row[:, instruction_positions].sum(dim=1).mean().item())
+            sink_shares.append(last_row[:, 0].mean().item())
+
+        instruction_len = len(instruction_positions)
+        row = {
+            "context_len": context_len,
+            "instruction_len": instruction_len,
+            "share_on_instruction": sum(instruction_shares) / len(instruction_shares),
+            "sink_share": sum(sink_shares) / len(sink_shares),
+            # Равномерное внимание — одинаковый вес 1/context_len на токен.
+            # После исключения sink оставшиеся веса не перенормируем.
+            "uniform_share": instruction_len / context_len,
+        }
+        rows.append(row)
+        print(
+            f'Контекст {context_len}: инструкция={row["share_on_instruction"]:.5f}, '
+            f'sink={row["sink_share"]:.5f}, равномерно={row["uniform_share"]:.5f}'
+        )
+        # Матрицы внимания занимают много памяти: освобождаем их перед
+        # следующим проходом, особенно для входа из 1024 токенов.
+        del outputs, attention, last_row
+
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "dilution.csv"
+    with destination.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=list(rows[0]))
+        writer.writeheader()
+        writer.writerows(rows)
     return destination
 
 
@@ -640,6 +722,11 @@ def main() -> None:
     # Задание 4а: внимание местоимения к антецеденту.
     attention_destination = create_attention_map(model, tokenizer)
     print(f'Карта внимания сохранена в {attention_destination} и attention_map.png')
+
+    # Задание 4б: как добавление текста меняет внимание к инструкции.
+    corpus_text = corpus_destination.read_text(encoding="utf-8")
+    dilution_destination = create_dilution_csv(corpus_text, model, tokenizer, fast=args.fast)
+    print(f'Размывание внимания сохранено в {dilution_destination}')
 
 if __name__ == "__main__":
     main()
