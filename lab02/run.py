@@ -5,18 +5,23 @@
 import argparse
 import json
 import re
-import torch
-from transformers import AutoModel
-from transformers import AutoTokenizer
 from functools import lru_cache
 from pathlib import Path
 from urllib.request import urlopen
+
+import matplotlib
+import torch
+from transformers import AutoModel, AutoTokenizer
+
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
 
 HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
 CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/master/books_before/WarAndPeace.txt"
 TOKENIZER_NAME = "Qwen/Qwen3-0.6B-Base"
 E5_MODEL_NAME = "intfloat/multilingual-e5-small"
+ATTENTION_SENTENCE = "Врач осмотрел пациента и сказал, что его анализы готовы."
 ENGLISH_PARAGRAPH = (
     "The prince had been talking for almost an hour, and the guests were growing tired. "
     "Anna looked at the clock, then at the window, then at the clock again. "
@@ -221,6 +226,109 @@ def create_search_json(paragraphs, paragraph_vectors, model, tokenizer, e5_model
     )
     for method in hits:
         print(f'{method} recall@{k}: {hits[method]}/{len(SEARCH_QUERIES)} = {recall[method]:.3f}')
+    return destination
+
+
+def find_word_token_positions(sentence, word, offsets):
+    """Найти токены, чьи символьные интервалы пересекают указанное слово."""
+    # Находим границы первого целого слова в исходном тексте, а не его часть.
+    # match.start() — начало слова, match.end() — позиция сразу после него.
+    match = re.search(r"\b" + re.escape(word) + r"\b", sentence)
+    if match is None:
+        raise ValueError(f'Слово {word!r} отсутствует в предложении')
+    # offsets[i] = (start, end) показывает, какие символы покрывает токен i.
+    # Слово может состоять из нескольких токенов — собираем все пересечения.
+    positions = [
+        i for i, (start, end) in enumerate(offsets)
+        if start < match.end() and end > match.start()
+    ]
+    if not positions:
+        raise ValueError(f'Не найдены токены слова {word!r}')
+    return positions
+
+
+def create_attention_map(model, tokenizer, sentence=ATTENTION_SENTENCE):
+    """Найти голову с максимальным вниманием от «его» к «пациента», сохранить JSON и график."""
+    # Вместе с ID токенов получаем их границы в исходном предложении.
+    inputs = tokenizer(
+        sentence, return_tensors="pt", add_special_tokens=False,
+        return_offsets_mapping=True,
+    )
+    # Смещения нужны для поиска слов, но не являются входом модели.
+    offsets = inputs.pop("offset_mapping")[0].tolist()
+    pronoun_pos = find_word_token_positions(sentence, "его", offsets) # Местоположение "его"
+    antecedent_pos = find_word_token_positions(sentence, "пациента", offsets) # Местоположение "пациента"
+    # Читаемые подписи нужны для JSON и оси X графика; модель получает сами ID.
+    token_ids = inputs["input_ids"][0].tolist()
+    tokens = [tokenizer.decode([token_id]) for token_id in token_ids]
+    inputs = inputs.to(model.get_input_embeddings().weight.device)
+
+    # Просим вернуть матрицы внимания всех слоев. Градиенты и кеш для
+    # генерации не нужны: выполняем один проход по готовому предложению.
+    with torch.inference_mode():
+        outputs = model(**inputs, output_attentions=True, use_cache=False)
+
+    if outputs.attentions is None or any(a is None for a in outputs.attentions):
+        raise ValueError('Для получения внимания загрузите Qwen3 с attn_implementation="eager"')
+
+    # Любая доля внимания неотрицательна, поэтому первая голова станет лучшей.
+    best_share = -1.0
+    for layer, attention in enumerate(outputs.attentions):
+        # attention: [1, головы, токены запроса, токены ключа].
+        # Берем строку последнего токена местоимения для каждой головы.
+        rows = attention[0, :, pronoun_pos[-1], :].float()
+        # У слова «пациента» несколько токенов: складываем их веса отдельно
+        # для каждой головы. Получаем по одной доле внимания на голову.
+        shares = rows[:, antecedent_pos].sum(dim=1)
+        # Сначала выбираем лучшую голову текущего слоя, затем сравниваем
+        # ее с лучшими головами уже просмотренных слоев.
+        head = int(shares.argmax().item())
+        share = shares[head].item()
+        if share > best_share:
+            best_share = share
+            best_layer = layer
+            best_head = head
+            # Сохраняем всю строку, чтобы показать внимание ко всем токенам.
+            weights = rows[head].cpu().tolist()
+
+    # Номера слоев, голов и токенов записываются с нуля.
+    data = {
+        "sentence": sentence,
+        "tokens": tokens,
+        "pronoun_pos": pronoun_pos,
+        "antecedent_pos": antecedent_pos,
+        "best_layer": best_layer,
+        "best_head": best_head,
+        "weights": weights,
+        "share_on_antecedent": sum(weights[i] for i in antecedent_pos),
+    }
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "attention_map.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+
+    # Высота столбика — вес внимания от «его» к соответствующему токену.
+    # Оранжевым отмечаем «пациента», зеленым — токен, из которого смотрим.
+    colors = ["tab:orange" if i in antecedent_pos else "tab:blue" for i in range(len(tokens))]
+    colors[pronoun_pos[-1]] = "tab:green"
+    fig, ax = plt.subplots(figsize=(12, 5))
+    ax.bar(range(len(tokens)), weights, color=colors)
+    ax.set_xticks(range(len(tokens)))
+    ax.set_xticklabels([f'{i}: {token!r}' for i, token in enumerate(tokens)], rotation=60, ha="right")
+    ax.set_ylabel("Вес внимания от последнего токена «его»")
+    ax.set_title(
+        f'Слой {best_layer}, голова {best_head} (нумерация с 0); '
+        f'доля на «пациента»: {data["share_on_antecedent"]:.1%}'
+    )
+    fig.tight_layout()
+    fig.savefig(ARTIFACTS / "attention_map.png", dpi=150)
+    # После сохранения освобождаем ресурсы фигуры.
+    plt.close(fig)
+    print(
+        f'Внимание: слой {best_layer}, голова {best_head}, '
+        f'доля на «пациента»: {data["share_on_antecedent"]:.4f}'
+    )
     return destination
 
 
@@ -484,7 +592,9 @@ def main() -> None:
     print('Загружаем Qwen3 для получения входных эмбеддингов')
     # На GPU используем float16; на CPU — float32 без медленной эмуляции bf16.
     model_dtype = torch.float16 if device.type == "cuda" else torch.float32
-    model = AutoModel.from_pretrained(TOKENIZER_NAME, dtype=model_dtype).to(device)
+    model = AutoModel.from_pretrained(
+        TOKENIZER_NAME, dtype=model_dtype, attn_implementation="eager",
+    ).to(device)
     model.eval()
     tokenizer = get_qwen_tokenizer()
 
@@ -526,6 +636,10 @@ def main() -> None:
         e5_tokenizer=e5_tokenizer,
     )
     print(f'Результаты static, contextual и e5 сохранены в {search_destination}')
+
+    # Задание 4а: внимание местоимения к антецеденту.
+    attention_destination = create_attention_map(model, tokenizer)
+    print(f'Карта внимания сохранена в {attention_destination} и attention_map.png')
 
 if __name__ == "__main__":
     main()
