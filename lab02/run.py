@@ -7,6 +7,7 @@ import json
 import re
 import torch
 from transformers import AutoModel
+from transformers import AutoTokenizer
 from functools import lru_cache
 from pathlib import Path
 from urllib.request import urlopen
@@ -15,6 +16,7 @@ HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
 CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/master/books_before/WarAndPeace.txt"
 TOKENIZER_NAME = "Qwen/Qwen3-0.6B-Base"
+E5_MODEL_NAME = "intfloat/multilingual-e5-small"
 ENGLISH_PARAGRAPH = (
     "The prince had been talking for almost an hour, and the guests were growing tired. "
     "Anna looked at the clock, then at the window, then at the clock again. "
@@ -117,6 +119,29 @@ def get_contextual_vector(text: str, model, tokenizer):
     return vector.cpu()
 
 
+def get_e5_vector(text: str, model, tokenizer, prefix="passage"):
+    """Получить вектор E5: префикс, энкодер, среднее по маске, нормализация."""
+    if prefix not in ("query", "passage"):
+        raise ValueError("Для E5 нужен префикс query или passage")
+    inputs = tokenizer(
+        f"{prefix}: {text}",
+        max_length=512,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+    )
+    device = model.get_input_embeddings().weight.device
+    inputs = inputs.to(device)
+    with torch.inference_mode():
+        token_vectors = model(**inputs).last_hidden_state.float()
+        # Маска равна 1 у настоящих токенов и 0 у padding.
+        mask = inputs["attention_mask"].unsqueeze(-1).bool()
+        token_vectors = token_vectors.masked_fill(~mask, 0.0)
+        vector = token_vectors.sum(dim=1) / mask.sum(dim=1)
+        vector = torch.nn.functional.normalize(vector, p=2, dim=1)
+    return vector.squeeze(0).cpu()
+
+
 def search_by_cosine(query_vector, paragraph_vectors, k=5):
     """Выбрать номера k ближайших абзацев по готовым векторам любого способа."""
     # Сравниваем один вектор запроса с каждой строкой матрицы абзацев.
@@ -127,7 +152,7 @@ def search_by_cosine(query_vector, paragraph_vectors, k=5):
     return torch.argsort(similarities, descending=True, stable=True)[:k].tolist()
 
 
-def create_search_json(paragraphs, paragraph_vectors, model, tokenizer):
+def create_search_json(paragraphs, paragraph_vectors, model, tokenizer, e5_model=None, e5_tokenizer=None):
     """Идет по таблице запросов из задания, находит нужный абзац по ключевой фразе,
         получает вектор запроса, сравнивает этот вектор с каждым вектором абзацев, находит ближайшие"""
     k = 5
@@ -137,6 +162,8 @@ def create_search_json(paragraphs, paragraph_vectors, model, tokenizer):
         "static": get_static_vector,
         "contextual": get_contextual_vector,
     }
+    if "e5" in paragraph_vectors and (e5_model is None or e5_tokenizer is None):
+        raise ValueError("Для поиска e5 нужно передать его модель и токенизатор")
     hits = {method: 0 for method in paragraph_vectors}
     for query, answer_phrase in SEARCH_QUERIES:
 
@@ -151,7 +178,10 @@ def create_search_json(paragraphs, paragraph_vectors, model, tokenizer):
         # Ищем k самых близких векторов абзацев к вектору запроса
         top = {}
         for method, vectors in paragraph_vectors.items():
-            query_vector = vector_functions[method](query, model, tokenizer)
+            if method == "e5":
+                query_vector = get_e5_vector(query, e5_model, e5_tokenizer, prefix="query")
+            else:
+                query_vector = vector_functions[method](query, model, tokenizer)
             top[method] = search_by_cosine(query_vector, vectors, k=k)
         
         # Определеяем, есть ли среди k самых близких векторов абзацев правильный абзац
@@ -312,7 +342,6 @@ def create_bpe_json(stats, merges, words_dict):
 @lru_cache(maxsize=1)
 def get_qwen_tokenizer():
     """Загрузить токенизатор один раз; веса модели здесь не нужны."""
-    from transformers import AutoTokenizer
 
     return AutoTokenizer.from_pretrained(TOKENIZER_NAME)
 
@@ -365,7 +394,18 @@ def compare_tokens_per_word(words):
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--fast", action="store_true", help="быстрый режим для CI")
+    ap.add_argument(
+        "--device", choices=("auto", "cpu", "cuda"), default="cpu",
+        help="устройство для моделей (по умолчанию cpu); auto выбирает CUDA, если она доступна",
+    )
     args = ap.parse_args()
+    if args.device == "cuda" and not torch.cuda.is_available():
+        ap.error("CUDA недоступна: используйте --device cpu или --device auto")
+    device_name = args.device
+    if device_name == "auto":
+        device_name = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_name)
+    print(f'Устройство моделей: {device}')
     ARTIFACTS.mkdir(exist_ok=True)
 
     # Скачиваем текст
@@ -442,7 +482,9 @@ def main() -> None:
     print(f'Абзацы сохранены в {paragraphs_destination}')
 
     print('Загружаем Qwen3 для получения входных эмбеддингов')
-    model = AutoModel.from_pretrained(TOKENIZER_NAME, dtype="auto")
+    # На GPU используем float16; на CPU — float32 без медленной эмуляции bf16.
+    model_dtype = torch.float16 if device.type == "cuda" else torch.float32
+    model = AutoModel.from_pretrained(TOKENIZER_NAME, dtype=model_dtype).to(device)
     model.eval()
     tokenizer = get_qwen_tokenizer()
 
@@ -464,13 +506,26 @@ def main() -> None:
     contextual_vectors = torch.stack(contextual_vectors)
     print(f'\nФорма матрицы contextual: {tuple(contextual_vectors.shape)}')
 
+    print('Загружаем E5 для поиска по смыслу')
+    e5_tokenizer = AutoTokenizer.from_pretrained(E5_MODEL_NAME)
+    e5_model = AutoModel.from_pretrained(E5_MODEL_NAME).to(device)
+    e5_model.eval()
+    e5_vectors = []
+    for i, paragraph in enumerate(paragraphs):
+        e5_vectors.append(get_e5_vector(paragraph, e5_model, e5_tokenizer, prefix="passage"))
+        print(f'\rE5: {i + 1}/{len(paragraphs)} абзацев', end="", flush=True)
+    e5_vectors = torch.stack(e5_vectors)
+    print(f'\nФорма матрицы e5: {tuple(e5_vectors.shape)}')
+
     search_destination = create_search_json(
         paragraphs,
-        {"static": static_vectors, "contextual": contextual_vectors},
+        {"static": static_vectors, "contextual": contextual_vectors, "e5": e5_vectors},
         model,
         tokenizer,
+        e5_model=e5_model,
+        e5_tokenizer=e5_tokenizer,
     )
-    print(f'Результаты static и contextual сохранены в {search_destination}')
+    print(f'Результаты static, contextual и e5 сохранены в {search_destination}')
 
 if __name__ == "__main__":
     main()
