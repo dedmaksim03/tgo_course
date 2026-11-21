@@ -32,3 +32,6 @@ Thumbs.db
 
 # Для лабораторной 2
 /lab02/corpus.txt
+
+# Для лабораторной 3
+/lab03/corpus.txt
