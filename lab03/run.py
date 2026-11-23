@@ -19,6 +19,7 @@ HERE = Path(__file__).resolve().parent
 ARTIFACTS = HERE / "artifacts"
 BPE = HERE.parent / "lab02" / "artifacts" / "bpe.json"
 CORPUS_URL = "https://raw.githubusercontent.com/nevmenandr/word2vec-russian-novels/master/books_before/WarAndPeace.txt"
+SAMPLE_PROMPT = "князь андрей"
 
 
 class TokenPositionEmbeddings(nn.Module):
@@ -191,9 +192,64 @@ def calculate_loss(model, inputs, targets):
     )
 
 
+def encode_prompt(text, merges, token_to_id):
+    """Разбить затравку теми же слияниями BPE и вернуть ID ее токенов."""
+    words = re.findall(r"[а-я]+(?:-[а-я]+)*", text.lower().replace("ё", "е"))
+    ids = []
+    for word in words:
+        parts = list(word) + ["</w>"]
+        for pair in merges:
+            parts = replace_chars(parts, tuple(pair))
+        ids.extend(token_to_id[token] for token in parts)
+    return ids
+
+
+def decode_ids(ids, id_to_token):
+    """Склеить части слов и заменить маркеры конца слова пробелами."""
+    return "".join(id_to_token[token_id] for token_id in ids).replace("</w>", " ").strip()
+
+
+def generate(model, prompt_ids, max_new_tokens, temperature=1.0, generator=None):
+    device = next(model.parameters()).device
+    ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
+    was_training = model.training
+    model.eval()
+    try:
+        with torch.no_grad():
+            for _ in range(max_new_tokens):
+                # В модель передаем последние токены (по размеру контекста)
+                logits = model(ids[:, -model.context:])[:, -1, :]
+                if temperature == 0:
+                    next_id = logits.argmax(dim=-1, keepdim=True)
+                else:
+                    probabilities = torch.softmax(logits / temperature, dim=-1)
+                    next_id = torch.multinomial(probabilities, 1, generator=generator)
+                ids = torch.cat((ids, next_id), dim=1)
+    finally:
+        # Снятие образца не должно оставлять обучающую модель в режиме eval.
+        model.train(was_training)
+    return ids[0].tolist()
+
+
+def save_training_sample(model, prompt_ids, id_to_token, samples, step, generator):
+    """Добавить один образец и сохранить все уже полученные образцы в samples.json."""
+    ids = generate(
+        model, prompt_ids, max_new_tokens=60,
+        temperature=samples["temperature"], generator=generator,
+    )
+    text = decode_ids(ids, id_to_token)
+    samples["samples"].append({"step": step, "text": text})
+    ARTIFACTS.mkdir(exist_ok=True)
+    (ARTIFACTS / "samples.json").write_text(
+        json.dumps(samples, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    print(f'Образец на шаге {step}: {text}', flush=True)
+
+
 def train_model(
     model, train_data, val_inputs, val_targets, *, steps, batch_size,
-    lr, eval_interval, generator, initial_losses,
+    lr, eval_interval, generator, initial_losses, prompt_ids, id_to_token,
+    sample_steps, sample_seed=44,
 ):
     optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
     ARTIFACTS.mkdir(exist_ok=True)
@@ -201,6 +257,9 @@ def train_model(
     started = perf_counter()
     interval_loss = 0.0
     interval_steps = 0
+    samples = {"prompt": SAMPLE_PROMPT, "temperature": 0.8, "samples": []}
+    sample_steps = set(sample_steps)
+    sample_generator = torch.Generator(device=next(model.parameters()).device).manual_seed(sample_seed)
 
     with destination.open("w", encoding="utf-8", newline="") as file:
         writer = csv.DictWriter(file, fieldnames=("step", "train_loss", "val_loss"))
@@ -210,6 +269,9 @@ def train_model(
             "step": 0, "train_loss": initial_losses[0], "val_loss": initial_losses[1],
         })
         file.flush()
+
+        if 0 in sample_steps:
+            save_training_sample(model, prompt_ids, id_to_token, samples, 0, sample_generator)
 
         model.train()
         for step in range(1, steps + 1):
@@ -240,6 +302,10 @@ def train_model(
                 )
                 interval_loss = 0.0
                 interval_steps = 0
+
+            # Здесь step обновлений уже завершено: снимаем образец текущих весов.
+            if step in sample_steps:
+                save_training_sample(model, prompt_ids, id_to_token, samples, step, sample_generator)
 
     return {
         "steps": steps,
@@ -461,6 +527,10 @@ def main() -> None:
         eval_interval=25 if args.fast else 100,
         generator=train_generator,
         initial_losses=(train_loss, val_loss),
+        prompt_ids=encode_prompt(SAMPLE_PROMPT, merges, token_to_id),
+        id_to_token=id_to_token,
+        sample_steps=(0, 50, 100, 200) if args.fast else (0, 100, 500, 2000),
+        sample_seed=seed + 2,
     )
     training_info.update({
         "seed": seed,
@@ -471,6 +541,7 @@ def main() -> None:
     config_destination = save_model_config(model, training_info)
     print(f'Обучение завершено за {training_info["train_minutes"]:.2f} мин.')
     print(f'Кривая обучения сохранена в {ARTIFACTS / "train_curve.csv"}')
+    print(f'Образцы текста сохранены в {ARTIFACTS / "samples.json"}')
     print(f'Конфигурация обучения сохранена в {config_destination}')
 
 

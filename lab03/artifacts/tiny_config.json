@@ -8,7 +8,7 @@
   "steps": 2000,
   "batch": 32,
   "lr": 0.001,
-  "train_minutes": 0.5532382449998597,
+  "train_minutes": 0.5676084050006466,
   "seed": 42,
   "train_tokens": 753639,
   "val_tokens": 83470,
