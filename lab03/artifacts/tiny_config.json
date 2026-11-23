@@ -1,0 +1,10 @@
+{
+  "vocab_size": 1516,
+  "d_model": 128,
+  "n_layers": 4,
+  "n_heads": 4,
+  "d_ff": 512,
+  "context": 128,
+  "n_params": 1199340,
+  "device": "cuda:0"
+}
