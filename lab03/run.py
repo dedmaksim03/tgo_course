@@ -4,8 +4,10 @@
 Слияния BPE берутся из lab02/artifacts/bpe.json.
 """
 import argparse
+import csv
 import json
 from pathlib import Path
+from time import perf_counter
 from urllib.request import urlopen
 import re
 
@@ -189,9 +191,69 @@ def calculate_loss(model, inputs, targets):
     )
 
 
-def save_model_config(model):
+def train_model(
+    model, train_data, val_inputs, val_targets, *, steps, batch_size,
+    lr, eval_interval, generator, initial_losses,
+):
+    optimizer = torch.optim.AdamW(model.parameters(), lr=lr)
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "train_curve.csv"
+    started = perf_counter()
+    interval_loss = 0.0
+    interval_steps = 0
+
+    with destination.open("w", encoding="utf-8", newline="") as file:
+        writer = csv.DictWriter(file, fieldnames=("step", "train_loss", "val_loss"))
+        writer.writeheader()
+        # Шаг 0: ошибки на случайных весах, до первого обновления параметров.
+        writer.writerow({
+            "step": 0, "train_loss": initial_losses[0], "val_loss": initial_losses[1],
+        })
+        file.flush()
+
+        model.train()
+        for step in range(1, steps + 1):
+            inputs, targets = get_batch(
+                train_data, batch_size=batch_size, context=model.context, generator=generator,
+            )
+            # Градиенты накапливаются, поэтому перед новым шагом очищаем старые.
+            optimizer.zero_grad(set_to_none=True)
+            loss = calculate_loss(model, inputs, targets)
+            loss.backward()  # Вычисляем, как каждый параметр влияет на ошибку.
+            optimizer.step()  # AdamW изменяет параметры с учетом градиентов.
+
+            # item() оставляет обычное число, не сохраняя графы прошлых шагов.
+            interval_loss += loss.item()
+            interval_steps += 1
+            if step % eval_interval == 0 or step == steps:
+                # Используем те же 20 окон val на всех проверках, не обучаясь на них.
+                model.eval()
+                with torch.no_grad():
+                    val_loss = calculate_loss(model, val_inputs, val_targets).item()
+                model.train()
+                train_loss = interval_loss / interval_steps
+                writer.writerow({"step": step, "train_loss": train_loss, "val_loss": val_loss})
+                file.flush()  # Уже полученные измерения останутся при прерывании запуска.
+                print(
+                    f'Шаг {step}/{steps}: train_loss={train_loss:.4f}, '
+                    f'val_loss={val_loss:.4f}', flush=True,
+                )
+                interval_loss = 0.0
+                interval_steps = 0
+
+    return {
+        "steps": steps,
+        "batch": batch_size,
+        "lr": lr,
+        "train_minutes": (perf_counter() - started) / 60,
+    }
+
+
+def save_model_config(model, training_info=None):
     """Записать архитектуру, точное число параметров и устройство модели."""
     config = model.config.copy()
+    if training_info is not None:
+        config.update(training_info)
     # Считаем реальные тензоры параметров, а не приблизительный размер модели.
     config["n_params"] = sum(parameter.numel() for parameter in model.parameters())
     config["device"] = str(next(model.parameters()).device)
@@ -341,7 +403,8 @@ def main() -> None:
     print(f'Токенов в train: {len(train_ids)}, в val: {len(val_ids)}')
 
     # Первое окно обучающего потока: пока один пример в батче.
-    torch.manual_seed(42)
+    seed = 42
+    torch.manual_seed(seed)
     model = TinyLanguageModel(vocab_size=len(token_to_id)).to(device)
     embedding_layer = model.embeddings
     input_ids = torch.tensor(
@@ -366,14 +429,14 @@ def main() -> None:
     train_data = torch.tensor(train_ids, dtype=torch.long, device=device)
     val_data = torch.tensor(val_ids, dtype=torch.long, device=device)
     batch_size = 16 if args.fast else 32
-    train_generator = torch.Generator().manual_seed(42)
+    train_generator = torch.Generator().manual_seed(seed)
     train_inputs, train_targets = get_batch(
         train_data, batch_size=batch_size, context=model.context, generator=train_generator,
     )
 
     # Отдельный генератор не зависит от случайного выбора обучающих окон.
     # Эти 20 окон создаем один раз и будем повторно использовать для проверки.
-    val_generator = torch.Generator().manual_seed(43)
+    val_generator = torch.Generator().manual_seed(seed + 1)
     val_inputs, val_targets = get_batch(
         val_data, batch_size=20, context=model.context, generator=val_generator,
     )
@@ -387,6 +450,28 @@ def main() -> None:
     print(f'Размер обучающего батча: {tuple(train_inputs.shape)}')
     print(f'Размер фиксированного проверочного батча: {tuple(val_inputs.shape)}')
     print(f'Начальный train_loss: {train_loss:.4f}, val_loss: {val_loss:.4f}')
+
+    # Полный режим: 2000 обновлений и проверка каждые 100 шагов.
+    # --fast: 200 обновлений и проверка каждые 25 шагов, батч уже уменьшен до 16.
+    training_info = train_model(
+        model, train_data, val_inputs, val_targets,
+        steps=200 if args.fast else 2000,
+        batch_size=batch_size,
+        lr=1e-3,
+        eval_interval=25 if args.fast else 100,
+        generator=train_generator,
+        initial_losses=(train_loss, val_loss),
+    )
+    training_info.update({
+        "seed": seed,
+        "train_tokens": len(train_ids),
+        "val_tokens": len(val_ids),
+        "bpe_merges": len(merges),
+    })
+    config_destination = save_model_config(model, training_info)
+    print(f'Обучение завершено за {training_info["train_minutes"]:.2f} мин.')
+    print(f'Кривая обучения сохранена в {ARTIFACTS / "train_curve.csv"}')
+    print(f'Конфигурация обучения сохранена в {config_destination}')
 
 
 if __name__ == "__main__":
