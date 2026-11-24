@@ -209,7 +209,32 @@ def decode_ids(ids, id_to_token):
     return "".join(id_to_token[token_id] for token_id in ids).replace("</w>", " ").strip()
 
 
-def generate(model, prompt_ids, max_new_tokens, temperature=1.0, generator=None):
+def apply_top_p(logits, top_p):
+    """Оставить минимальный набор наиболее вероятных токенов с суммой не меньше p."""
+    if top_p == 1:
+        return logits
+
+    # Сортируем и запоминаем изначальные позиции
+    sorted_logits, indices = torch.sort(logits, descending=True, dim=-1)
+
+    # Вероятности через softmax для всех токенов
+    probabilities = torch.softmax(sorted_logits, dim=-1)
+
+    # Последовательно складываем значения. Последний элемент = 1
+    cumulative = probabilities.cumsum(dim=-1)
+
+    # Создаем список с предыдущими значениями, на основе cumulative
+    # Последний элемент в previous_mass = предпоследнему в cumulative
+    previous_mass = torch.cat((torch.zeros_like(cumulative[..., :1]), cumulative[..., :-1]), dim=-1)
+
+    # Заменяем на -inf логиты не прошедшие условие
+    sorted_logits = sorted_logits.masked_fill(previous_mass >= top_p, float("-inf"))
+    
+    # Возвращаем оценки на исходные позиции ID: сортировка была только для отбора.
+    return torch.full_like(logits, float("-inf")).scatter(-1, indices, sorted_logits)
+
+
+def generate(model, prompt_ids, max_new_tokens, temperature=1.0, top_p=None, generator=None):
     device = next(model.parameters()).device
     ids = torch.tensor([prompt_ids], dtype=torch.long, device=device)
     was_training = model.training
@@ -222,13 +247,72 @@ def generate(model, prompt_ids, max_new_tokens, temperature=1.0, generator=None)
                 if temperature == 0:
                     next_id = logits.argmax(dim=-1, keepdim=True)
                 else:
-                    probabilities = torch.softmax(logits / temperature, dim=-1)
+                    logits = logits / temperature
+                    if top_p is not None:
+                        logits = apply_top_p(logits, top_p)
+                    probabilities = torch.softmax(logits, dim=-1)
                     next_id = torch.multinomial(probabilities, 1, generator=generator)
                 ids = torch.cat((ids, next_id), dim=1)
     finally:
         # Снятие образца не должно оставлять обучающую модель в режиме eval.
         model.train(was_training)
     return ids[0].tolist()
+
+
+def find_loop_start(ids):
+    """Позиция первой четверки, уже встречавшейся раньше; нумерация с нуля."""
+    seen = set()
+    for start in range(len(ids) - 3):
+        four_tokens = tuple(ids[start:start + 4])
+        if four_tokens in seen:
+            return start
+        seen.add(four_tokens)
+    return None
+
+
+def create_generation_json(model, prompt_ids, id_to_token, max_new_tokens=80, seed=45):
+    """Сравнить четыре режима на одних весах и записать generation.json."""
+    modes = (
+        ("greedy", 0.0, None), # Жадный выбор, выбор максимального на каждом шаге
+        ("t0.7", 0.7, None), # Температура
+        ("t1.5", 1.5, None),
+        ("top_p0.9", 1.0, 0.9), # Выбор топ p самых вероятных токенов и выбор среди них
+    )
+    runs = []
+    device = next(model.parameters()).device
+    for name, temperature, top_p in modes:
+        generator = torch.Generator(device=device).manual_seed(seed)
+        all_ids = generate(
+            model, prompt_ids, max_new_tokens, temperature=temperature,
+            top_p=top_p, generator=generator,
+        )
+        # В пункте 5 ids и loop_start относятся только к НОВЫМ токенам.
+        new_ids = all_ids[len(prompt_ids):]
+        run = {
+            "name": name,
+            "temperature": temperature,
+            "top_p": top_p,
+            "text": decode_ids(new_ids, id_to_token),
+            "ids": new_ids,
+            "n_tokens": len(new_ids),
+        }
+        if name == "greedy":
+            run["loop_start"] = find_loop_start(new_ids)
+        runs.append(run)
+        print(f'Генерация {name}: {run["text"]}', flush=True)
+
+    data = {
+        "model": "tiny",
+        "prompt": SAMPLE_PROMPT,
+        "max_new_tokens": max_new_tokens,
+        "runs": runs,
+    }
+    ARTIFACTS.mkdir(exist_ok=True)
+    destination = ARTIFACTS / "generation.json"
+    destination.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8",
+    )
+    return destination
 
 
 def save_training_sample(model, prompt_ids, id_to_token, samples, step, generator):
@@ -543,6 +627,13 @@ def main() -> None:
     print(f'Кривая обучения сохранена в {ARTIFACTS / "train_curve.csv"}')
     print(f'Образцы текста сохранены в {ARTIFACTS / "samples.json"}')
     print(f'Конфигурация обучения сохранена в {config_destination}')
+
+    # Пункт 5: четыре способа продолжения одной затравки после обучения.
+    generation_destination = create_generation_json(
+        model, encode_prompt(SAMPLE_PROMPT, merges, token_to_id), id_to_token,
+        max_new_tokens=40 if args.fast else 80, seed=seed + 3,
+    )
+    print(f'Сравнение режимов генерации сохранено в {generation_destination}')
 
 
 if __name__ == "__main__":
