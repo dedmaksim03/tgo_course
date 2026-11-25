@@ -23,6 +23,7 @@ htmlcov/
 
 # uv cache used for local checks
 .uv-cache-check/
+.hf-cache/
 
 # IDE and OS files
 .idea/

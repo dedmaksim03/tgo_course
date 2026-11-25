@@ -8,3 +8,5 @@ torch
 transformers
 accelerate
 pytest
+datasets
+peft

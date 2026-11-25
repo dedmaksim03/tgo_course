@@ -1,0 +1,13 @@
+{
+  "dataset": "mteb/GeoreviewClassification",
+  "n_test": 1000,
+  "fast": false,
+  "class_counts": {
+    "1": 191,
+    "2": 196,
+    "3": 193,
+    "4": 214,
+    "5": 206
+  },
+  "modes": {}
+}
