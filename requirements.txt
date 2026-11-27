@@ -10,3 +10,4 @@ accelerate
 pytest
 datasets
 peft
+psutil
